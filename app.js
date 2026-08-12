@@ -176,6 +176,11 @@
   btn('btn-focus').addEventListener('click', () => { focus = !focus; applyFocus(); });
 
   addEventListener('keydown', (e) => {
+    if (editing) {
+      if (e.key === 'Escape') { e.preventDefault(); cancelEditing(); }
+      else if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); saveEditing(); }
+      return;
+    }
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName)) return;
     switch (e.key) {
@@ -183,6 +188,7 @@
       case 'f': focus = !focus; applyFocus(); break;
       case 'b': bionic = !bionic; applyBionic(); break;
       case 's': font = font === 'serif' ? 'sans' : 'serif'; applyFont(); break;
+      case 'e': if (IS_LOCAL) startEditing(); break;
       case 'd': theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length]; applyTheme(); break;
       case '-': case '_': scale -= 0.075; applyScale(); break;
       case '+': case '=': scale += 0.075; applyScale(); break;
@@ -222,12 +228,63 @@
         const d = await r.json();
         if (!r.ok) throw new Error(d.error || 'share failed');
         await navigator.clipboard.writeText(d.url).catch(() => { /* clipboard optional */ });
-        toast(`Link copied — ${d.url}`, d.url);
+        const hrs = d.expires ? Math.max(1, Math.round((new Date(d.expires) - Date.now()) / 3.6e6)) : 0;
+        toast(`Link copied — ${hrs ? `expires in ${hrs} h` : 'no expiry'} — ${d.url}`, d.url);
       } catch (err) {
         toast('Sharing failed: ' + err.message);
       }
       b.classList.remove('busy');
     });
+  }
+
+  /* ── edit mode (local reader only) ────────────────────── */
+  let editing = false;
+  let editSnapshot = null;
+
+  function setEditing(on) {
+    editing = on;
+    article.contentEditable = on ? 'true' : 'false';
+    article.classList.toggle('editing', on);
+    btn('btn-edit')?.classList.toggle('on', on);
+  }
+
+  function startEditing() {
+    if (bionic) { bionic = false; applyBionic(); }
+    if (focus) { focus = false; applyFocus(); }
+    editSnapshot = article.innerHTML;
+    setEditing(true);
+    article.focus();
+    toast('Editing — ✎ or ⌘S saves, Esc cancels');
+  }
+
+  function cancelEditing() {
+    article.innerHTML = editSnapshot;
+    setEditing(false);
+    toast('Edit cancelled');
+  }
+
+  async function saveEditing() {
+    setEditing(false);
+    try {
+      const r = await fetch('/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ html: article.innerHTML }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      toast('Saved ✓');
+      // The file write triggers live reload, which re-renders everything fresh.
+    } catch (err) {
+      setEditing(true);
+      toast('Save failed: ' + err.message);
+    }
+  }
+
+  if (!IS_LOCAL) {
+    btn('btn-edit')?.remove();
+  } else {
+    btn('btn-edit').addEventListener('click', () => (editing ? saveEditing() : startEditing()));
   }
 
   /* ── branding (local reader only — shared copies are static) ── */
@@ -260,7 +317,7 @@
   /* ── live reload (file watcher on the server) ─────────── */
   try {
     new EventSource('/events').addEventListener('message', (e) => {
-      if (e.data === 'reload') location.reload();
+      if (e.data === 'reload' && !editing) location.reload();
     });
   } catch { /* no live reload */ }
 

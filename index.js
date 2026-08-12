@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createServer } from 'node:http';
-import { readFileSync, writeFileSync, existsSync, watch, statSync, unlinkSync, mkdirSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, watch, statSync, unlinkSync, mkdirSync } from 'node:fs';
 import { resolve, dirname, extname, join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { exec, execFileSync } from 'node:child_process';
@@ -9,6 +9,8 @@ import { tmpdir, homedir } from 'node:os';
 import { Marked } from 'marked';
 import { markedHighlight } from 'marked-highlight';
 import hljs from 'highlight.js';
+import TurndownService from 'turndown';
+import turndownGfm from 'turndown-plugin-gfm';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -140,11 +142,41 @@ const MIME = {
   '.css': 'text/css', '.js': 'text/javascript', '.json': 'application/json', '.txt': 'text/plain',
 };
 
-/* ── sharing (Cloudflare Pages) ─────────────────────────── */
+/* ── edit mode: browser HTML back to markdown ───────────── */
+function htmlToMarkdown(html) {
+  const td = new TurndownService({
+    headingStyle: 'atx',
+    hr: '---',
+    codeBlockStyle: 'fenced',
+    bulletListMarker: '-',
+    emDelimiter: '*',
+  });
+  td.use(turndownGfm.gfm);
+  td.keep(['kbd', 'sup', 'sub', 'mark', 'abbr']);
+  // Tight list markers ("- item", "1. item") instead of turndown's padded default,
+  // with continuation lines indented to the content column.
+  td.addRule('listItem', {
+    filter: 'li',
+    replacement: (content, node, options) => {
+      const parent = node.parentNode;
+      let prefix = options.bulletListMarker + ' ';
+      if (parent.nodeName === 'OL') {
+        const start = parent.getAttribute('start');
+        const index = Array.prototype.indexOf.call(parent.children, node);
+        prefix = (start ? Number(start) + index : index + 1) + '. ';
+      }
+      const indent = ' '.repeat(prefix.length);
+      content = content.replace(/^\n+/, '').replace(/\n+$/, '\n').replace(/\n/gm, '\n' + indent);
+      return prefix + content + (node.nextSibling && !/\n$/.test(content) ? '\n' : '');
+    },
+  });
+  return td.turndown(html).replace(/^(\s*[-*] \[[ x]\]) +/gm, '$1 ');
+}
+
+/* ── sharing (Cloudflare Workers KV — keys auto-expire) ── */
 const SHARE_ROOT = join(homedir(), '.mdread');
-const SHARE_DIR = join(SHARE_ROOT, 'share');
 const MANIFEST = join(SHARE_ROOT, 'shares.json');
-let PAGES_PROJECT = 'mdread-share';
+const DEFAULT_TTL_HOURS = 24;
 
 /* ── branding ───────────────────────────────────────────── */
 const BRAND_EXTS = ['.svg', '.png', '.jpg', '.jpeg', '.webp'];
@@ -181,57 +213,60 @@ function loadDotEnv() {
 
 function ensureCloudflareEnv() {
   loadDotEnv();
-  if (!process.env.CLOUDFLARE_API_TOKEN && !(process.env.CLOUDFLARE_API_KEY && process.env.CLOUDFLARE_EMAIL)) {
-    throw new Error('no Cloudflare credentials — copy .env.example to .env next to index.js and fill it in.');
-  }
-  if (process.env.MDREAD_PAGES_PROJECT) PAGES_PROJECT = process.env.MDREAD_PAGES_PROJECT;
-}
-
-function requireCloudflareEnv() {
-  try { ensureCloudflareEnv(); } catch (err) {
-    console.error(`mdread: ${err.message}`);
-    process.exit(1);
+  const missing = ['CLOUDFLARE_ACCOUNT_ID', 'MDREAD_KV_NAMESPACE', 'MDREAD_SHARE_URL'].filter((k) => !process.env[k]);
+  if (!process.env.CLOUDFLARE_API_TOKEN && !(process.env.CLOUDFLARE_API_KEY && process.env.CLOUDFLARE_EMAIL)) missing.unshift('CLOUDFLARE_API_TOKEN');
+  if (missing.length) {
+    throw new Error(`missing ${missing.join(', ')} — copy .env.example to .env next to index.js and fill it in.`);
   }
 }
 
-// Pages keeps every historical deployment alive on its own preview URL, which
-// would defeat unshare — so after each deploy, delete everything but the latest.
-async function pruneOldDeployments() {
-  try {
-    const acct = process.env.CLOUDFLARE_ACCOUNT_ID;
-    if (!acct) return;
-    const headers = process.env.CLOUDFLARE_API_TOKEN
-      ? { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` }
-      : { 'X-Auth-Email': process.env.CLOUDFLARE_EMAIL, 'X-Auth-Key': process.env.CLOUDFLARE_API_KEY };
-    const base = `https://api.cloudflare.com/client/v4/accounts/${acct}/pages/projects/${PAGES_PROJECT}/deployments`;
-    const list = await (await fetch(`${base}?per_page=25`, { headers })).json();
-    if (!list.success) return;
-    for (const d of list.result.slice(1)) {
-      await fetch(`${base}/${d.id}?force=true`, { method: 'DELETE', headers });
-    }
-  } catch { /* pruning is best-effort */ }
+function cfHeaders() {
+  return process.env.CLOUDFLARE_API_TOKEN
+    ? { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` }
+    : { 'X-Auth-Email': process.env.CLOUDFLARE_EMAIL, 'X-Auth-Key': process.env.CLOUDFLARE_API_KEY };
+}
+
+// One key per share; Cloudflare deletes it when expiration_ttl runs out.
+async function kvValue(method, key, body, ttlSeconds) {
+  const url = new URL(
+    `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}` +
+    `/storage/kv/namespaces/${process.env.MDREAD_KV_NAMESPACE}/values/${encodeURIComponent(key)}`
+  );
+  if (ttlSeconds) url.searchParams.set('expiration_ttl', String(ttlSeconds));
+  const res = await fetch(url, { method, headers: cfHeaders(), body });
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok || out.success === false) {
+    throw new Error('Cloudflare KV error: ' + (out.errors?.[0]?.message || `HTTP ${res.status}`));
+  }
+}
+
+function shareTtlHours() {
+  const i = argv.indexOf('--ttl');
+  if (i > -1) return parseFloat(argv[i + 1]) || 0;
+  if (argv.includes('--forever')) return 0;
+  const env = parseFloat(process.env.MDREAD_SHARE_TTL_HOURS);
+  return Number.isFinite(env) ? env : DEFAULT_TTL_HOURS;
 }
 
 // Publish the current file; used by both `mdread share` and the reader's share button.
-async function publishCurrent() {
+async function publishCurrent(ttlHours = DEFAULT_TTL_HOURS) {
   ensureCloudflareEnv();
   let page = renderPage()
     .replace(/try \{\s*new EventSource[\s\S]*?\} catch \{[^}]*\}/, '/* live reload stripped for shared copy */');
   page = inlineImages(page);
 
   const shares = loadShares();
-  // Re-sharing the same file updates it in place, keeping its URL stable.
+  // Re-sharing the same file updates it in place, keeping its URL stable (and resetting its TTL).
   let slug = Object.keys(shares).find((s) => shares[s].file === mdPath);
   if (!slug) slug = (slugify(basename(mdPath).replace(/\.md$/i, '')) || 'doc') + '-' + randomBytes(4).toString('hex');
 
-  mkdirSync(SHARE_DIR, { recursive: true });
-  writeFileSync(join(SHARE_DIR, slug + '.html'), page);
-  deployShares();
+  const ttlSec = ttlHours > 0 ? Math.max(60, Math.round(ttlHours * 3600)) : 0;
+  await kvValue('PUT', slug, page, ttlSec);
 
-  shares[slug] = { file: mdPath, shared: new Date().toISOString().slice(0, 10) };
+  const expires = ttlSec ? new Date(Date.now() + ttlSec * 1000).toISOString() : null;
+  shares[slug] = { file: mdPath, shared: new Date().toISOString(), expires };
   saveShares(shares);
-  await pruneOldDeployments();
-  return `https://${PAGES_PROJECT}.pages.dev/${slug}`;
+  return { url: `${process.env.MDREAD_SHARE_URL.replace(/\/+$/, '')}/${slug}`, expires };
 }
 
 const loadShares = () => {
@@ -254,44 +289,48 @@ function inlineImages(html) {
   });
 }
 
-function wrangler(args) {
-  return execFileSync('wrangler', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-}
-
-function deployShares() {
-  mkdirSync(SHARE_DIR, { recursive: true });
-  writeFileSync(join(SHARE_DIR, '_headers'), '/*\n  X-Robots-Tag: noindex\n');
-  writeFileSync(join(SHARE_DIR, 'index.html'),
-    '<!doctype html><meta charset="utf-8"><title>mdread</title><body style="background:#16181c"></body>');
-  try { wrangler(['pages', 'project', 'create', PAGES_PROJECT, '--production-branch', 'main']); }
-  catch { /* already exists */ }
-  wrangler(['pages', 'deploy', SHARE_DIR, '--project-name', PAGES_PROJECT, '--branch', 'main']);
-}
+const friendlyExpiry = (iso) => {
+  if (!iso) return 'no expiry';
+  const h = (new Date(iso) - Date.now()) / 3.6e6;
+  if (h <= 0) return 'expired';
+  return h < 48 ? `expires in ${Math.round(h)} h` : `expires in ${Math.round(h / 24)} days`;
+};
 
 if (cmd === 'share') {
-  console.log('  deploying to Cloudflare Pages…');
-  let url;
-  try { url = await publishCurrent(); } catch (err) {
+  console.log('  publishing…');
+  let r;
+  try { r = await publishCurrent(shareTtlHours()); } catch (err) {
     console.error(`mdread: ${err.message}`);
     process.exit(1);
   }
-  if (process.platform === 'darwin') exec(`printf %s ${JSON.stringify(url)} | pbcopy`);
-  console.log(`\n  ▍shared — ${basename(mdPath)}\n  ${url}` + (process.platform === 'darwin' ? '  (copied to clipboard)' : '') + '\n');
+  if (process.platform === 'darwin') exec(`printf %s ${JSON.stringify(r.url)} | pbcopy`);
+  console.log(`\n  ▍shared — ${basename(mdPath)} · ${friendlyExpiry(r.expires)}\n  ${r.url}` + (process.platform === 'darwin' ? '  (copied to clipboard)' : '') + '\n');
   process.exit(0);
 }
 
 if (cmd === 'shares') {
   const shares = loadShares();
+  // KV already deleted expired keys; drop them from the local list too.
+  let changed = false;
+  for (const s of Object.keys(shares)) {
+    if (shares[s].expires && new Date(shares[s].expires) < Date.now()) { delete shares[s]; changed = true; }
+  }
+  if (changed) saveShares(shares);
   const slugs = Object.keys(shares);
-  if (!slugs.length) { console.log('mdread: nothing shared yet.'); process.exit(0); }
+  if (!slugs.length) { console.log('mdread: nothing shared right now.'); process.exit(0); }
+  loadDotEnv();
+  const base = (process.env.MDREAD_SHARE_URL || '').replace(/\/+$/, '');
   for (const s of slugs) {
-    console.log(`  ${shares[s].shared}  https://${PAGES_PROJECT}.pages.dev/${s}\n              ${shares[s].file}`);
+    console.log(`  ${friendlyExpiry(shares[s].expires).padEnd(18)} ${base}/${s}\n${' '.repeat(21)}${shares[s].file}`);
   }
   process.exit(0);
 }
 
 if (cmd === 'unshare') {
-  requireCloudflareEnv();
+  try { ensureCloudflareEnv(); } catch (err) {
+    console.error(`mdread: ${err.message}`);
+    process.exit(1);
+  }
   const target = argv[1];
   const shares = loadShares();
   const slugs = target === 'all' ? Object.keys(shares) : [target];
@@ -300,14 +339,11 @@ if (cmd === 'unshare') {
     process.exit(1);
   }
   for (const s of slugs) {
-    rmSync(join(SHARE_DIR, s + '.html'), { force: true });
+    try { await kvValue('DELETE', s); } catch { /* may already be expired */ }
     delete shares[s];
   }
-  console.log('  redeploying without ' + (target === 'all' ? 'all shares' : target) + '…');
-  deployShares();
   saveShares(shares);
-  await pruneOldDeployments();
-  console.log('  done.');
+  console.log(`  removed ${slugs.length} share${slugs.length === 1 ? '' : 's'}.`);
   process.exit(0);
 }
 
@@ -336,12 +372,36 @@ const server = createServer((req, res) => {
 
   // Share button in the reader publishes the current file.
   if (url.pathname === '/share' && req.method === 'POST') {
-    publishCurrent().then((shareUrl) => {
+    publishCurrent(shareTtlHours()).then((r) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ url: shareUrl }));
+      res.end(JSON.stringify(r));
     }).catch((err) => {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message.split('\n')[0] }));
+    });
+    return;
+  }
+
+  // Edit mode saves the browser's HTML back to the markdown file.
+  if (url.pathname === '/save' && req.method === 'POST') {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      try {
+        const { html } = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const markdown = htmlToMarkdown(html);
+        // Keep a timestamped backup of the previous version.
+        const backupDir = join(SHARE_ROOT, 'backups');
+        mkdirSync(backupDir, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        writeFileSync(join(backupDir, `${basename(mdPath, '.md')}-${stamp}.md`), readFileSync(mdPath));
+        writeFileSync(mdPath, markdown.trimEnd() + '\n');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+      }
     });
     return;
   }

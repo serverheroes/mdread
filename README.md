@@ -23,7 +23,8 @@ genuinely help distractible brains stay on the line they're reading.
 - **Orientation** — progress bar, reading-time estimate, slide-out table of contents that tracks your section
 - **Adjustable** — text size, typeface; all settings remembered
 - **Live reload** — edit the file, the page refreshes and keeps your scroll position
-- **Sharing** — `mdread share` publishes a self-contained copy to Cloudflare Pages
+- **Sharing** — one click publishes a self-contained copy; links self-destruct after 24 h
+- **Edit mode** — edit the rendered page right in the browser; saves back to the `.md` file
 - **Branding** — drag a PNG/SVG logo onto the reader; it tops every document, shared copies included
 - Code highlighting, GFM tables, task lists, and local images all work
 
@@ -35,6 +36,7 @@ genuinely help distractible brains stay on the line they're reading.
 | `f` | focus mode |
 | `b` | bionic reading |
 | `s` | serif / sans |
+| `e` | edit mode (`⌘S` / ✎ saves, `Esc` cancels) |
 | `d` | cycle theme |
 | `+` / `−` | text size |
 
@@ -53,26 +55,39 @@ mdread demo.md
 ## Sharing
 
 ```sh
-mdread share notes.md       # → https://<project>.pages.dev/notes-a1b2c3d4  (copied to clipboard)
-mdread shares               # list everything you've shared
-mdread unshare <slug|all>   # take shares down
+mdread share notes.md            # → https://<worker>.workers.dev/notes-a1b2c3d4  (copied)
+mdread share notes.md --ttl 72   # keep it up for 72 hours instead
+mdread share notes.md --forever  # no expiry
+mdread shares                    # list current shares
+mdread unshare <slug|all>        # take shares down early
 ```
 
 There's also a share button in the reader toolbar — it publishes the open file
 and puts the link on your clipboard.
 
-Shared pages are fully self-contained (styles, reader tools, and local images
-inlined), get unguessable URLs, and are marked `noindex` so search engines skip
-them. They stay up indefinitely until you `unshare` them. Re-sharing the same
-file updates it at the same URL, and old Pages deployments are pruned after
-every deploy so removed or superseded content isn't reachable through
-deployment-history URLs.
+**Shares self-destruct after 24 hours** (configurable via `--ttl` or
+`MDREAD_SHARE_TTL_HOURS`). Documents are stored in Cloudflare Workers KV with a
+native expiration TTL, so deletion happens on Cloudflare's side with no cron
+and no further interaction. Shared pages are fully self-contained (styles,
+reader tools, and local images inlined), get unguessable URLs, and are served
+with `noindex` and `no-store` headers. Re-sharing the same file updates it at
+the same URL and resets its clock.
 
-Setup: copy `.env.example` to `.env` and fill in a Cloudflare API token
-(scoped to Pages only) and account ID. Values can be plain text or 1Password
-CLI references (`op://vault/item/field`) resolved at deploy time — no secret
-ever sits in the repo. Uploads go through `wrangler` (`npm i -g wrangler`),
-authenticated purely by those env vars; no `wrangler login` needed.
+Setup (one-time): create a KV namespace, deploy `worker/worker.js` with the
+namespace bound as `SHARES`, and copy `.env.example` to `.env` with an API
+token scoped to *Workers KV Storage: Edit* only. Values can be plain text or
+1Password CLI references (`op://vault/item/field`) resolved at publish time —
+no secret ever sits on disk. Publishing is a single API call: instant, no
+build step, no wrangler.
+
+## Edit mode
+
+Press `e` (or the ✎ button) and the page becomes directly editable — the
+rendered page, not markdown source. Click ✎ again or hit `⌘S` to save: the
+HTML is converted back to markdown and written to your `.md` file (a
+timestamped backup of the previous version is kept in `~/.mdread/backups/`).
+`Esc` cancels. The conversion round-trips cleanly — saving without edits
+produces a byte-identical file.
 
 ## Branding
 

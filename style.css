@@ -328,6 +328,14 @@ article tr:last-child td { border-bottom: 0; }
 }
 #drop-hint.show { opacity: 1; }
 
+/* ── edit mode ──────────────────────────────────────────── */
+article.editing {
+  outline: 1px dashed color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: 1.4rem;
+  border-radius: 2px;
+  caret-color: var(--accent);
+}
+
 /* ── share button + toast ───────────────────────────────── */
 #btn-share.busy { pointer-events: none; }
 #btn-share.busy svg { animation: share-pulse 1s ease-in-out infinite; }
