@@ -190,8 +190,48 @@
     }
   });
 
+  /* ── share button (local reader only — shared copies are static) ── */
+  const IS_LOCAL = ['127.0.0.1', 'localhost'].includes(location.hostname);
+
+  let toastTimer;
+  function toast(msg, href) {
+    let el = document.getElementById('toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'toast';
+      el.addEventListener('click', () => { if (el.dataset.href) open(el.dataset.href, '_blank'); });
+      document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.dataset.href = href || '';
+    el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('show'), 7000);
+  }
+
+  if (!IS_LOCAL) {
+    btn('btn-share')?.remove();
+  } else {
+    btn('btn-share').addEventListener('click', async (e) => {
+      const b = e.currentTarget;
+      if (b.classList.contains('busy')) return;
+      b.classList.add('busy');
+      toast('Publishing…');
+      try {
+        const r = await fetch('/share', { method: 'POST' });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'share failed');
+        await navigator.clipboard.writeText(d.url).catch(() => { /* clipboard optional */ });
+        toast(`Link copied — ${d.url}`, d.url);
+      } catch (err) {
+        toast('Sharing failed: ' + err.message);
+      }
+      b.classList.remove('busy');
+    });
+  }
+
   /* ── branding (local reader only — shared copies are static) ── */
-  if (['127.0.0.1', 'localhost'].includes(location.hostname)) {
+  if (IS_LOCAL) {
     const BRAND_TYPES = ['image/png', 'image/svg+xml', 'image/jpeg', 'image/webp'];
     const hint = document.createElement('div');
     hint.id = 'drop-hint';

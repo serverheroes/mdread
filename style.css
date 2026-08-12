@@ -328,6 +328,27 @@ article tr:last-child td { border-bottom: 0; }
 }
 #drop-hint.show { opacity: 1; }
 
+/* ── share button + toast ───────────────────────────────── */
+#btn-share.busy { pointer-events: none; }
+#btn-share.busy svg { animation: share-pulse 1s ease-in-out infinite; }
+@keyframes share-pulse { 50% { opacity: .25; } }
+#toast {
+  position: fixed; bottom: 1.4rem; left: 50%; z-index: 70;
+  transform: translateX(-50%) translateY(10px);
+  max-width: min(90vw, 44rem);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border); border-radius: 99px;
+  padding: .65rem 1.2rem;
+  font-family: var(--sans); font-size: .85rem; color: var(--ink);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+  opacity: 0; pointer-events: none;
+  transition: opacity .25s ease, transform .25s ease;
+}
+#toast.show { opacity: 1; pointer-events: auto; transform: translateX(-50%) translateY(0); }
+
 /* ── syntax highlighting ────────────────────────────────── */
 .hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-built_in, .hljs-type { color: var(--hl-key); }
 .hljs-string, .hljs-regexp, .hljs-addition { color: var(--hl-str); }

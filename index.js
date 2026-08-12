@@ -179,16 +179,59 @@ function loadDotEnv() {
   }
 }
 
-function requireCloudflareEnv() {
-  try { loadDotEnv(); } catch (err) {
-    console.error(`mdread: could not resolve credentials from .env — ${err.message}`);
-    process.exit(1);
-  }
+function ensureCloudflareEnv() {
+  loadDotEnv();
   if (!process.env.CLOUDFLARE_API_TOKEN && !(process.env.CLOUDFLARE_API_KEY && process.env.CLOUDFLARE_EMAIL)) {
-    console.error('mdread: no Cloudflare credentials — copy .env.example to .env next to index.js and fill it in.');
-    process.exit(1);
+    throw new Error('no Cloudflare credentials — copy .env.example to .env next to index.js and fill it in.');
   }
   if (process.env.MDREAD_PAGES_PROJECT) PAGES_PROJECT = process.env.MDREAD_PAGES_PROJECT;
+}
+
+function requireCloudflareEnv() {
+  try { ensureCloudflareEnv(); } catch (err) {
+    console.error(`mdread: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+// Pages keeps every historical deployment alive on its own preview URL, which
+// would defeat unshare — so after each deploy, delete everything but the latest.
+async function pruneOldDeployments() {
+  try {
+    const acct = process.env.CLOUDFLARE_ACCOUNT_ID;
+    if (!acct) return;
+    const headers = process.env.CLOUDFLARE_API_TOKEN
+      ? { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` }
+      : { 'X-Auth-Email': process.env.CLOUDFLARE_EMAIL, 'X-Auth-Key': process.env.CLOUDFLARE_API_KEY };
+    const base = `https://api.cloudflare.com/client/v4/accounts/${acct}/pages/projects/${PAGES_PROJECT}/deployments`;
+    const list = await (await fetch(`${base}?per_page=25`, { headers })).json();
+    if (!list.success) return;
+    for (const d of list.result.slice(1)) {
+      await fetch(`${base}/${d.id}?force=true`, { method: 'DELETE', headers });
+    }
+  } catch { /* pruning is best-effort */ }
+}
+
+// Publish the current file; used by both `mdread share` and the reader's share button.
+async function publishCurrent() {
+  ensureCloudflareEnv();
+  let page = renderPage()
+    .replace(/try \{\s*new EventSource[\s\S]*?\} catch \{[^}]*\}/, '/* live reload stripped for shared copy */');
+  page = inlineImages(page);
+
+  const shares = loadShares();
+  // Re-sharing the same file updates it in place, keeping its URL stable.
+  let slug = Object.keys(shares).find((s) => shares[s].file === mdPath);
+  if (!slug) slug = (slugify(basename(mdPath).replace(/\.md$/i, '')) || 'doc') + '-' + randomBytes(4).toString('hex');
+
+  mkdirSync(SHARE_DIR, { recursive: true });
+  writeFileSync(join(SHARE_DIR, slug + '.html'), page);
+  deployShares();
+
+  shares[slug] = { file: mdPath, shared: new Date().toISOString().slice(0, 10) };
+  saveShares(shares);
+  await pruneOldDeployments();
+  return `https://${PAGES_PROJECT}.pages.dev/${slug}`;
 }
 
 const loadShares = () => {
@@ -226,24 +269,12 @@ function deployShares() {
 }
 
 if (cmd === 'share') {
-  requireCloudflareEnv();
-  let page = renderPage()
-    .replace(/try \{\s*new EventSource[\s\S]*?\} catch \{[^}]*\}/, '/* live reload stripped for shared copy */');
-  page = inlineImages(page);
-
-  const shares = loadShares();
-  // Re-sharing the same file updates it in place, keeping its URL stable.
-  let slug = Object.keys(shares).find((s) => shares[s].file === mdPath);
-  if (!slug) slug = (slugify(basename(mdPath).replace(/\.md$/i, '')) || 'doc') + '-' + randomBytes(4).toString('hex');
-
-  mkdirSync(SHARE_DIR, { recursive: true });
-  writeFileSync(join(SHARE_DIR, slug + '.html'), page);
   console.log('  deploying to Cloudflare Pages…');
-  deployShares();
-
-  shares[slug] = { file: mdPath, shared: new Date().toISOString().slice(0, 10) };
-  saveShares(shares);
-  const url = `https://${PAGES_PROJECT}.pages.dev/${slug}`;
+  let url;
+  try { url = await publishCurrent(); } catch (err) {
+    console.error(`mdread: ${err.message}`);
+    process.exit(1);
+  }
   if (process.platform === 'darwin') exec(`printf %s ${JSON.stringify(url)} | pbcopy`);
   console.log(`\n  ▍shared — ${basename(mdPath)}\n  ${url}` + (process.platform === 'darwin' ? '  (copied to clipboard)' : '') + '\n');
   process.exit(0);
@@ -275,6 +306,7 @@ if (cmd === 'unshare') {
   console.log('  redeploying without ' + (target === 'all' ? 'all shares' : target) + '…');
   deployShares();
   saveShares(shares);
+  await pruneOldDeployments();
   console.log('  done.');
   process.exit(0);
 }
@@ -299,6 +331,18 @@ const server = createServer((req, res) => {
   if (url.pathname === '/ping') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ app: 'mdread', file: mdPath }));
+    return;
+  }
+
+  // Share button in the reader publishes the current file.
+  if (url.pathname === '/share' && req.method === 'POST') {
+    publishCurrent().then((shareUrl) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ url: shareUrl }));
+    }).catch((err) => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message.split('\n')[0] }));
+    });
     return;
   }
 

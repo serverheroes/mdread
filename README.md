@@ -58,9 +58,15 @@ mdread shares               # list everything you've shared
 mdread unshare <slug|all>   # take shares down
 ```
 
+There's also a share button in the reader toolbar — it publishes the open file
+and puts the link on your clipboard.
+
 Shared pages are fully self-contained (styles, reader tools, and local images
 inlined), get unguessable URLs, and are marked `noindex` so search engines skip
-them. Re-sharing the same file updates it at the same URL.
+them. They stay up indefinitely until you `unshare` them. Re-sharing the same
+file updates it at the same URL, and old Pages deployments are pruned after
+every deploy so removed or superseded content isn't reachable through
+deployment-history URLs.
 
 Setup: copy `.env.example` to `.env` and fill in a Cloudflare API token
 (scoped to Pages only) and account ID. Values can be plain text or 1Password
