@@ -1,0 +1,17 @@
+{
+  "name": "mdread",
+  "version": "1.0.0",
+  "description": "ADHD-friendly, book-style markdown reader in the browser",
+  "type": "module",
+  "bin": {
+    "mdread": "./index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "highlight.js": "^11.10.0",
+    "marked": "^15.0.0",
+    "marked-highlight": "^2.2.0"
+  }
+}
