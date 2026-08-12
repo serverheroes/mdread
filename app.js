@@ -190,6 +190,33 @@
     }
   });
 
+  /* ── branding (local reader only — shared copies are static) ── */
+  if (['127.0.0.1', 'localhost'].includes(location.hostname)) {
+    const BRAND_TYPES = ['image/png', 'image/svg+xml', 'image/jpeg', 'image/webp'];
+    const hint = document.createElement('div');
+    hint.id = 'drop-hint';
+    hint.innerHTML = '<span>Drop a PNG / SVG logo to brand this document</span>';
+    document.body.appendChild(hint);
+    let dragDepth = 0;
+    addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; hint.classList.add('show'); });
+    addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; hint.classList.remove('show'); } });
+    addEventListener('dragover', (e) => e.preventDefault());
+    addEventListener('drop', async (e) => {
+      e.preventDefault();
+      dragDepth = 0;
+      hint.classList.remove('show');
+      const f = e.dataTransfer?.files?.[0];
+      if (!f || !BRAND_TYPES.includes(f.type)) return;
+      await fetch('/brand', { method: 'POST', headers: { 'Content-Type': f.type }, body: f });
+      location.reload();
+    });
+    document.querySelector('.doc-brand img')?.addEventListener('dblclick', async () => {
+      if (!confirm('Remove branding from your documents?')) return;
+      await fetch('/brand', { method: 'DELETE' });
+      location.reload();
+    });
+  }
+
   /* ── live reload (file watcher on the server) ─────────── */
   try {
     new EventSource('/events').addEventListener('message', (e) => {

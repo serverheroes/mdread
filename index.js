@@ -1,38 +1,51 @@
 #!/usr/bin/env node
 import { createServer } from 'node:http';
-import { readFileSync, writeFileSync, existsSync, watch, statSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, watch, statSync, unlinkSync, mkdirSync, rmSync } from 'node:fs';
 import { resolve, dirname, extname, join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { exec } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { tmpdir } from 'node:os';
+import { exec, execFileSync } from 'node:child_process';
+import { createHash, randomBytes } from 'node:crypto';
+import { tmpdir, homedir } from 'node:os';
 import { Marked } from 'marked';
 import { markedHighlight } from 'marked-highlight';
 import hljs from 'highlight.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const fileArg = process.argv[2];
-if (!fileArg || fileArg === '-h' || fileArg === '--help') {
-  console.log('Usage: mdread <file.md>');
+const argv = process.argv.slice(2);
+const cmd = ['share', 'shares', 'unshare'].includes(argv[0]) ? argv[0] : 'read';
+const fileArg = cmd === 'read' ? argv[0] : argv[1];
+
+const USAGE = `Usage:
+  mdread <file.md>            read a file in the browser
+  mdread share <file.md>      publish a shareable copy to Cloudflare Pages
+  mdread shares               list shared documents
+  mdread unshare <slug|all>   remove shared documents (and redeploy)`;
+
+if (cmd === 'read' && (!fileArg || fileArg === '-h' || fileArg === '--help')) {
+  console.log(USAGE);
   process.exit(fileArg ? 0 : 1);
 }
+if ((cmd === 'share' && !fileArg) || (cmd === 'unshare' && !argv[1])) {
+  console.log(USAGE);
+  process.exit(1);
+}
 
-const mdPath = resolve(process.cwd(), fileArg);
-if (!existsSync(mdPath)) {
+const mdPath = fileArg ? resolve(process.cwd(), fileArg) : null;
+if ((cmd === 'read' || cmd === 'share') && !existsSync(mdPath)) {
   console.error(`mdread: file not found: ${mdPath}`);
   process.exit(1);
 }
-const baseDir = dirname(mdPath);
+const baseDir = mdPath ? dirname(mdPath) : process.cwd();
 
 const OPENER = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start ""' : 'xdg-open';
 
 // One server per file: if one is already running for this path, reuse it.
 const lockPath = join(
   tmpdir(),
-  'mdread-' + createHash('sha1').update(mdPath).digest('hex').slice(0, 12) + '.port'
+  'mdread-' + createHash('sha1').update(mdPath ?? '').digest('hex').slice(0, 12) + '.port'
 );
-if (existsSync(lockPath)) {
+if (cmd === 'read' && existsSync(lockPath)) {
   const port = readFileSync(lockPath, 'utf8').trim();
   try {
     const res = await fetch(`http://127.0.0.1:${port}/ping`, { signal: AbortSignal.timeout(700) });
@@ -108,6 +121,7 @@ function renderPage() {
   return asset('template.html')
     .replace('/*CSS*/', asset('style.css'))
     .replace('/*JS*/', asset('app.js'))
+    .replace('{{BRAND}}', brandImgTag())
     .replaceAll('{{TITLE}}', escapeHtml(title))
     .replace('{{FILENAME}}', escapeHtml(basename(mdPath)))
     .replace('{{META}}', `${words.toLocaleString('en-US')} words · ${minutes} min read`)
@@ -126,6 +140,146 @@ const MIME = {
   '.css': 'text/css', '.js': 'text/javascript', '.json': 'application/json', '.txt': 'text/plain',
 };
 
+/* ── sharing (Cloudflare Pages) ─────────────────────────── */
+const SHARE_ROOT = join(homedir(), '.mdread');
+const SHARE_DIR = join(SHARE_ROOT, 'share');
+const MANIFEST = join(SHARE_ROOT, 'shares.json');
+let PAGES_PROJECT = 'mdread-share';
+
+/* ── branding ───────────────────────────────────────────── */
+const BRAND_EXTS = ['.svg', '.png', '.jpg', '.jpeg', '.webp'];
+const brandFile = () => BRAND_EXTS.map((e) => join(SHARE_ROOT, 'brand' + e)).find(existsSync) || null;
+const clearBrand = () => BRAND_EXTS.forEach((e) => { try { unlinkSync(join(SHARE_ROOT, 'brand' + e)); } catch { /* absent */ } });
+
+// Rendered into every page (and baked into shared copies) as a data: URI.
+function brandImgTag() {
+  const p = brandFile();
+  if (!p) return '';
+  const mime = MIME[extname(p)] || 'image/png';
+  return `<div class="doc-brand"><img alt="logo" title="Double-click to remove branding" src="data:${mime};base64,${readFileSync(p).toString('base64')}"></div>`;
+}
+
+// Deploy credentials come from .env next to index.js; op:// values are
+// resolved through the 1Password CLI at runtime so no secret sits on disk.
+function loadDotEnv() {
+  const envPath = join(__dirname, '.env');
+  if (!existsSync(envPath)) return;
+  const vars = {};
+  for (const line of readFileSync(envPath, 'utf8').split('\n')) {
+    if (line.trim().startsWith('#')) continue;
+    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+    if (m) vars[m[1]] = m[2].replace(/^["']|["']$/g, '');
+  }
+  const opAccount = vars.OP_ACCOUNT || process.env.OP_ACCOUNT;
+  for (const [k, v] of Object.entries(vars)) {
+    if (k === 'OP_ACCOUNT' || process.env[k]) continue;
+    process.env[k] = v.startsWith('op://')
+      ? execFileSync('op', ['read', v, ...(opAccount ? ['--account', opAccount] : [])], { encoding: 'utf8' }).trim()
+      : v;
+  }
+}
+
+function requireCloudflareEnv() {
+  try { loadDotEnv(); } catch (err) {
+    console.error(`mdread: could not resolve credentials from .env — ${err.message}`);
+    process.exit(1);
+  }
+  if (!process.env.CLOUDFLARE_API_TOKEN && !(process.env.CLOUDFLARE_API_KEY && process.env.CLOUDFLARE_EMAIL)) {
+    console.error('mdread: no Cloudflare credentials — copy .env.example to .env next to index.js and fill it in.');
+    process.exit(1);
+  }
+  if (process.env.MDREAD_PAGES_PROJECT) PAGES_PROJECT = process.env.MDREAD_PAGES_PROJECT;
+}
+
+const loadShares = () => {
+  try { return JSON.parse(readFileSync(MANIFEST, 'utf8')); } catch { return {}; }
+};
+const saveShares = (m) => {
+  mkdirSync(SHARE_ROOT, { recursive: true });
+  writeFileSync(MANIFEST, JSON.stringify(m, null, 2) + '\n');
+};
+
+// A shared page must be fully self-contained: local images become data: URIs.
+function inlineImages(html) {
+  return html.replace(/(<img[^>]*?src=")([^"]+)(")/g, (m, pre, src, post) => {
+    if (/^(https?:|data:)/i.test(src)) return m;
+    try {
+      const p = resolve(baseDir, decodeURIComponent(src));
+      const mime = MIME[extname(p).toLowerCase()] || 'application/octet-stream';
+      return pre + `data:${mime};base64,` + readFileSync(p).toString('base64') + post;
+    } catch { return m; }
+  });
+}
+
+function wrangler(args) {
+  return execFileSync('wrangler', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+}
+
+function deployShares() {
+  mkdirSync(SHARE_DIR, { recursive: true });
+  writeFileSync(join(SHARE_DIR, '_headers'), '/*\n  X-Robots-Tag: noindex\n');
+  writeFileSync(join(SHARE_DIR, 'index.html'),
+    '<!doctype html><meta charset="utf-8"><title>mdread</title><body style="background:#16181c"></body>');
+  try { wrangler(['pages', 'project', 'create', PAGES_PROJECT, '--production-branch', 'main']); }
+  catch { /* already exists */ }
+  wrangler(['pages', 'deploy', SHARE_DIR, '--project-name', PAGES_PROJECT, '--branch', 'main']);
+}
+
+if (cmd === 'share') {
+  requireCloudflareEnv();
+  let page = renderPage()
+    .replace(/try \{\s*new EventSource[\s\S]*?\} catch \{[^}]*\}/, '/* live reload stripped for shared copy */');
+  page = inlineImages(page);
+
+  const shares = loadShares();
+  // Re-sharing the same file updates it in place, keeping its URL stable.
+  let slug = Object.keys(shares).find((s) => shares[s].file === mdPath);
+  if (!slug) slug = (slugify(basename(mdPath).replace(/\.md$/i, '')) || 'doc') + '-' + randomBytes(4).toString('hex');
+
+  mkdirSync(SHARE_DIR, { recursive: true });
+  writeFileSync(join(SHARE_DIR, slug + '.html'), page);
+  console.log('  deploying to Cloudflare Pages…');
+  deployShares();
+
+  shares[slug] = { file: mdPath, shared: new Date().toISOString().slice(0, 10) };
+  saveShares(shares);
+  const url = `https://${PAGES_PROJECT}.pages.dev/${slug}`;
+  if (process.platform === 'darwin') exec(`printf %s ${JSON.stringify(url)} | pbcopy`);
+  console.log(`\n  ▍shared — ${basename(mdPath)}\n  ${url}` + (process.platform === 'darwin' ? '  (copied to clipboard)' : '') + '\n');
+  process.exit(0);
+}
+
+if (cmd === 'shares') {
+  const shares = loadShares();
+  const slugs = Object.keys(shares);
+  if (!slugs.length) { console.log('mdread: nothing shared yet.'); process.exit(0); }
+  for (const s of slugs) {
+    console.log(`  ${shares[s].shared}  https://${PAGES_PROJECT}.pages.dev/${s}\n              ${shares[s].file}`);
+  }
+  process.exit(0);
+}
+
+if (cmd === 'unshare') {
+  requireCloudflareEnv();
+  const target = argv[1];
+  const shares = loadShares();
+  const slugs = target === 'all' ? Object.keys(shares) : [target];
+  if (target !== 'all' && !shares[target]) {
+    console.error(`mdread: no share named "${target}" — see \`mdread shares\`.`);
+    process.exit(1);
+  }
+  for (const s of slugs) {
+    rmSync(join(SHARE_DIR, s + '.html'), { force: true });
+    delete shares[s];
+  }
+  console.log('  redeploying without ' + (target === 'all' ? 'all shares' : target) + '…');
+  deployShares();
+  saveShares(shares);
+  console.log('  done.');
+  process.exit(0);
+}
+
+/* ── local reader server ────────────────────────────────── */
 const sseClients = new Set();
 
 const server = createServer((req, res) => {
@@ -145,6 +299,28 @@ const server = createServer((req, res) => {
   if (url.pathname === '/ping') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ app: 'mdread', file: mdPath }));
+    return;
+  }
+
+  // Branding: the reader drag-drops a logo here; DELETE removes it.
+  if (url.pathname === '/brand' && req.method === 'POST') {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => { size += c.length; if (size > 4 * 1024 * 1024) req.destroy(); else chunks.push(c); });
+    req.on('end', () => {
+      const ct = (req.headers['content-type'] || '').split(';')[0].trim();
+      const ext = { 'image/svg+xml': '.svg', 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp' }[ct];
+      if (!ext || !size) { res.writeHead(415); res.end(); return; }
+      mkdirSync(SHARE_ROOT, { recursive: true });
+      clearBrand();
+      writeFileSync(join(SHARE_ROOT, 'brand' + ext), Buffer.concat(chunks));
+      res.writeHead(204); res.end();
+    });
+    return;
+  }
+  if (url.pathname === '/brand' && req.method === 'DELETE') {
+    clearBrand();
+    res.writeHead(204); res.end();
     return;
   }
 
