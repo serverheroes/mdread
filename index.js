@@ -191,6 +191,20 @@ function brandImgTag() {
   return `<div class="doc-brand"><img alt="logo" title="Double-click to remove branding" src="data:${mime};base64,${readFileSync(p).toString('base64')}"></div>`;
 }
 
+// Launched from Finder, a GUI process gets a bare PATH without Homebrew et al,
+// so locate the 1Password CLI ourselves instead of relying on the lookup.
+function opBinary() {
+  const candidates = [
+    process.env.MDREAD_OP_BIN,
+    '/opt/homebrew/bin/op', '/usr/local/bin/op', '/usr/bin/op',
+    join(homedir(), '.local/bin/op'),
+  ].filter(Boolean);
+  const found = candidates.find(existsSync);
+  if (found) return found;
+  try { return execFileSync('/bin/sh', ['-lc', 'command -v op'], { encoding: 'utf8' }).trim() || 'op'; }
+  catch { return 'op'; }
+}
+
 // Deploy credentials come from .env next to index.js; op:// values are
 // resolved through the 1Password CLI at runtime so no secret sits on disk.
 function loadDotEnv() {
@@ -205,9 +219,18 @@ function loadDotEnv() {
   const opAccount = vars.OP_ACCOUNT || process.env.OP_ACCOUNT;
   for (const [k, v] of Object.entries(vars)) {
     if (k === 'OP_ACCOUNT' || process.env[k]) continue;
-    process.env[k] = v.startsWith('op://')
-      ? execFileSync('op', ['read', v, ...(opAccount ? ['--account', opAccount] : [])], { encoding: 'utf8' }).trim()
-      : v;
+    if (!v.startsWith('op://')) { process.env[k] = v; continue; }
+    try {
+      process.env[k] = execFileSync(opBinary(), ['read', v, ...(opAccount ? ['--account', opAccount] : [])], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim();
+    } catch (err) {
+      const detail = err.code === 'ENOENT'
+        ? '1Password CLI not found — install it (brew install 1password-cli) or set MDREAD_OP_BIN in .env'
+        : (err.stderr?.toString().trim().split('\n')[0] || err.message);
+      throw new Error(`could not read ${k} from 1Password: ${detail}`);
+    }
   }
 }
 
